@@ -1,116 +1,156 @@
-#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// --- LoRa AS32 TTL ---
-#define LORA_TX 17
+// ================== WiFi ==================
+const char* WIFI_SSID     = "Nghia";
+const char* WIFI_PASSWORD = "11223344";
+
+// ================== MQTT Cloud ==================
+const char* MQTT_SERVER   = "140c1fe0108343549da9b96c9afed071.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT  = 8883;
+const char* MQTT_USER     = "ducnghia";
+const char* MQTT_PASS     = "Asd3092003";
+const char* MQTT_CLIENT_ID = "Gateway";
+
+const char* MQTT_TOPIC = "iot/air/";
+
+// ================== LoRa ==================
+HardwareSerial LoRaSerial(2);
 #define LORA_RX 16
-#define M0_PIN 25
-#define M1_PIN 26
+#define LORA_TX 17
+#define M0_PIN  25
+#define M1_PIN  26
 
-// --- GP2Y1010 PM2.5 ---
-#define LED_PWR  4
-#define PM25_PIN 34
+// ================== LCD + Button ==================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+#define BTN_PIN 27
+int currentScreen = 0;
+unsigned long lastBtnTime = 0;
 
-// --- MQ-135 CO2 ---
-#define MQ135_PIN 35
+// ================== BIẾN ==================
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
 
-String nodeID = "Node2";
+// dữ liệu Node
+float pm25_1 = 0, co2_1 = 0;
+float pm25_2 = 0, co2_2 = 0;
 
-// --- Hàm đọc PM2.5 GP2Y1010 ổn định ---
-float readPM25_stable() {
-  float sum = 0;
-  const int n = 10;
 
-  // Bật LED làm nóng trước khi đọc
-  for(int i=0; i<3; i++){
-    digitalWrite(LED_PWR, HIGH);
-    delayMicroseconds(280);
-    digitalWrite(LED_PWR, LOW);
-    delay(50);
+// ================== WIFI ==================
+void setupWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
-
-  // Đọc trung bình nhiều lần
-  for(int i=0; i<n; i++){
-    digitalWrite(LED_PWR, HIGH);
-    delayMicroseconds(280);
-    int val = analogRead(PM25_PIN);
-    digitalWrite(LED_PWR, LOW);
-
-    float voltage = val * (3.3 / 4095.0);
-
-    float pm25 = 0.172 * voltage - 0.1;
-    if(pm25 < 0) pm25 = 0;
-
-    sum += pm25;
-    delay(10);
-  }
-  return sum / n;
+  Serial.println("\nWiFi connected");
 }
 
-
-// --- Hàm đọc CO2 MQ-135 trung bình nhiều lần ---
-float readCO2() {
-  const int n = 30;
-  float sum = 0;
-
-  for (int i = 0; i < n; i++) {
-    int raw = analogRead(MQ135_PIN);       // ADC 0–4095
-    sum += raw;
-    delay(20);
+// ================== MQTT ==================
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting MQTT...");
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+      Serial.println("OK");
+    } else {
+      delay(3000);
+    }
   }
-
-  float adc = sum / n;                      // trung bình ADC
-  float voltage = adc * (3.3 / 4095.0);     // đổi sang Volt (0–3.3V)
-
-  // ---- SCALE TƯƠNG ĐỐI ----
-  // MQ135 điện áp thấp ~ sạch (400 ppm)
-  // MQ135 điện áp cao ~ ô nhiễm (5000 ppm)
-  float ppm = (voltage - 0.2) * (5000.0 / (2.8 - 0.2));  
-
-  // ---- GIỚI HẠN ----
-  if (ppm < 400) ppm = 400;
-  if (ppm > 5000) ppm = 5000;
-
-  return ppm;
 }
 
+// ================== PARSE DATA ==================
+void parseData(String payload) {
+  // VD: Node1,PM25:35.2,CO2:820
+  if (payload.indexOf("Node1") >= 0) {
+    pm25_1 = payload.substring(payload.indexOf("PM25:") + 5, payload.indexOf(",CO2")).toFloat();
+    co2_1  = payload.substring(payload.indexOf("CO2:") + 4).toFloat();
+  }
+  else if (payload.indexOf("Node2") >= 0) {
+    pm25_2 = payload.substring(payload.indexOf("PM25:") + 5, payload.indexOf(",CO2")).toFloat();
+    co2_2  = payload.substring(payload.indexOf("CO2:") + 4).toFloat();
+  }
+}
+
+// ================== LCD ==================
+void updateLCD() {
+  lcd.clear();
+  if (currentScreen == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("Node 1");
+    lcd.setCursor(0, 1);
+    lcd.print("PM:");
+    lcd.print(pm25_1, 1);
+    lcd.print(" CO2:");
+    lcd.print((int)co2_1);
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("Node 2");
+    lcd.setCursor(0, 1);
+    lcd.print("PM:");
+    lcd.print(pm25_2, 1);
+    lcd.print(" CO2:");
+    lcd.print((int)co2_2);
+  }
+}
+
+// ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
 
-  // --- Thiết lập M0/M1 ở Mode Normal ---
+  // LoRa
+  LoRaSerial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
   pinMode(M0_PIN, OUTPUT);
   pinMode(M1_PIN, OUTPUT);
   digitalWrite(M0_PIN, LOW);
   digitalWrite(M1_PIN, LOW);
 
-  pinMode(LED_PWR, OUTPUT);
+  // Button
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
-  Serial.println("ESP32 Node PM2.5 + CO2 với LoRa sẵn sàng");
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Gateway Starting");
 
-  // Delay ban đầu để ESP32 và cảm biến ổn định
-  delay(5000);
+  setupWiFi();
+  espClient.setInsecure();
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
 
-  // Khởi tạo LoRa sau khi ESP32 ổn định
-  Serial2.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-
+  delay(1000);
+  lcd.clear();
 }
 
+// ================== LOOP ==================
 void loop() {
-  // --- Đọc PM2.5 và CO2 ---
-  float pm25 = readPM25_stable();
-  float co2 = readCO2();
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
 
-  // --- Chuỗi dữ liệu CSV ---
-  String data = nodeID + ",";
-  data += "PM25:" + String(pm25, 1) + ",";
-  data += "CO2:" + String(co2, 0);
+  // Đọc LoRa
+  if (LoRaSerial.available()) {
+    String data = LoRaSerial.readStringUntil('\n');
+    data.trim();
+    Serial.println(data);
 
-  // --- Gửi qua LoRa ---
-  Serial2.println(data);
+    parseData(data);
 
-  // --- In Serial monitor ---
-  Serial.print("Đang gửi: ");
-  Serial.println(data);
+    String topic = String(MQTT_TOPIC) + (data.startsWith("Node1") ? "node1" : "node2");
+    mqttClient.publish(topic.c_str(), data.c_str());
 
-  // --- Delay giữa các lần gửi để tránh tải đột ngột ---
-  delay(3000);
+    updateLCD();
+  }
+
+  // Đọc nút nhấn (debounce)
+  if (digitalRead(BTN_PIN) == LOW) {      
+  if (millis() - lastBtnTime > 300) {     
+    currentScreen = !currentScreen;    
+    updateLCD();                          
+    lastBtnTime = millis();
+  }
+}
 }

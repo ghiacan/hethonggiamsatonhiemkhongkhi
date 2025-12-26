@@ -1,157 +1,131 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
-#include <HardwareSerial.h>
-
-// ================== WiFi ==================
-const char* WIFI_SSID     = "Nghia";
-const char* WIFI_PASSWORD = "11223344";
-
-// ================== MQTT Cloud (HiveMQ) ==================
-const char* MQTT_SERVER   = "140c1fe0108343549da9b96c9afed071.s1.eu.hivemq.cloud";
-const uint16_t MQTT_PORT  = 8883;
-const char* MQTT_USER     = "ducnghia";
-const char* MQTT_PASS     = "Asd3092003";
-
-// Client ID: phải duy nhất
-const char* MQTT_CLIENT_ID = "Gateway";
-
-const char* MQTT_TOPIC = "iot/air/";
-
-// ================== LoRa AS32 (UART2) ==================
-HardwareSerial LoRaSerial(2);
-#define LORA_RX 16
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+// --- LoRa AS32 TTL ---
 #define LORA_TX 17
-#define M0_PIN  25
-#define M1_PIN  26
+#define LORA_RX 16
+#define M0_PIN 25
+#define M1_PIN 26
 
-// ================== BIẾN TOÀN CỤC ==================
-WiFiClientSecure espClient;
-PubSubClient mqttClient(espClient);
+// --- GP2Y1010 PM2.5 ---
+#define LED_PWR  4
+#define PM25_PIN 34
 
-unsigned long lastMqttReconnectAttempt = 0;
-const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+// --- MQ-135 CO2 ---
+#define MQ135_PIN 35
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ================== HÀM PHỤ TRỢ ==================
-void setupWiFi() {
-  Serial.print("Kết nối WiFi: ");
-  Serial.println(WIFI_SSID);
+String nodeID = "Node2";
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500);
-    Serial.print(".");
+float readPM25_stable() {
+  float sum = 0;
+  const int n = 10;
+  for(int i=0; i<3; i++){
+    digitalWrite(LED_PWR, HIGH);
+    delayMicroseconds(280);
+    digitalWrite(LED_PWR, LOW);
+    delay(50);
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-    Serial.print("IP ESP32 Gateway: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\n Không kết nối được WiFi (timeout)");
+  for(int i=0; i<n; i++){
+    digitalWrite(LED_PWR, HIGH);
+    delayMicroseconds(280);
+    int val = analogRead(PM25_PIN);
+    digitalWrite(LED_PWR, LOW);
+
+    float voltage = val * (3.3 / 4095.0);
+
+    float pm25 = 0.172 * voltage - 0.1;
+    if(pm25 < 0) pm25 = 0;
+
+    sum += pm25;
+    delay(10);
   }
+  return sum / n;
 }
 
-bool connectMQTT() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(" WiFi chưa kết nối, bỏ qua MQTT");
-    return false;
+
+// --- Hàm đọc CO2 MQ-135 trung bình nhiều lần ---
+float readCO2() {
+  const int n = 30;
+  float sum = 0;
+
+  for (int i = 0; i < n; i++) {
+    int raw = analogRead(MQ135_PIN);
+    sum += raw;
+    delay(20);
   }
 
-  Serial.print("Đang kết nối MQTT Cloud tới ");
-  Serial.print(MQTT_SERVER);
-  Serial.print(":");
-  Serial.print(MQTT_PORT);
-  Serial.print(" ... ");
+  float adc = sum / n;               
+  float voltage = adc * (3.3 / 4095.0);  
+  float ppm = (voltage - 0.2) * (5000.0 / (2.8 - 0.2));  
 
-  bool ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);
+  // ---- GIỚI HẠN ----
+  if (ppm < 400) ppm = 400;
+  if (ppm > 5000) ppm = 5000;
 
-  if (ok) {
-    Serial.println("OK");
-  } else {
-    Serial.print("Failed, rc=");
-    Serial.println(mqttClient.state());
-  }
-  return ok;
+  return ppm;
 }
 
-void ensureMQTTConnected() {
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
-      lastMqttReconnectAttempt = now;
-      connectMQTT();
-    }
-  }
-  mqttClient.loop();
-}
-
-// Lấy node từ payload: "Node1,PM25:...,CO2:..."
-String extractNodeId(const String& payload) {
-  int comma = payload.indexOf(',');
-  if (comma <= 0) return "";
-  String node = payload.substring(0, comma);
-  node.trim();
-  return node; // vd: "Node1"
-}
-
-// ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
-  delay(200);
 
-  // LoRa UART2
-  LoRaSerial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-
-  // M0/M1 normal mode
+  // --- Thiết lập M0/M1 ở Mode Normal ---
   pinMode(M0_PIN, OUTPUT);
   pinMode(M1_PIN, OUTPUT);
   digitalWrite(M0_PIN, LOW);
   digitalWrite(M1_PIN, LOW);
 
-  setupWiFi();
+  pinMode(LED_PWR, OUTPUT);
+  Wire.begin(21, 22);   // SDA, SCL
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
 
-  // MQTT secure: demo dùng insecure
-  espClient.setInsecure();
-  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  lcd.setCursor(0, 0);
+  lcd.print("Node2 Starting");
+  lcd.setCursor(0, 1);
+  lcd.print("Sensor Init...");
 
-  Serial.println("ESP32 Gateway MQTT Cloud ready");
+  delay(3000);
+
+  Serial2.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Node2 Ready");
+  lcd.setCursor(0, 1);
+  lcd.print("LoRa OK");
+
 }
 
-// ================== LOOP ==================
 void loop() {
-  ensureMQTTConnected();
+  // --- Đọc PM2.5 và CO2 ---
+  float pm25 = readPM25_stable();
+  float co2 = readCO2();
 
-  if (LoRaSerial.available()) {
-    String data = LoRaSerial.readStringUntil('\n');
-    data.trim();
-    if (data.length() == 0) return;
-    Serial.println(data);
+  // --- Chuỗi dữ liệu CSV ---
+  String data = nodeID + ",";
+  data += "PM25:" + String(pm25, 1) + ",";
+  data += "CO2:" + String(co2, 0);
 
-    // Tạo topic theo node
-    String nodeId = extractNodeId(data);
-    if (nodeId.length() == 0) {
-      Serial.println(" Không lấy được nodeId từ payload!");
-      return;
-    }
+  // --- Gửi qua LoRa ---
+  Serial2.println(data);
 
-    String topic = String(MQTT_TOPIC) + nodeId;   
-    topic.toLowerCase(); 
+  // --- In Serial monitor ---
+  Serial.print("Đang gửi: ");
+  Serial.println(data);
 
-    if (mqttClient.connected()) {
-      bool ok = mqttClient.publish(topic.c_str(), data.c_str());
-      if (ok) {
-        Serial.print("Đã gửi Data lên MQTT cloud: ");
-        Serial.println(data);
-      } else {
-        Serial.println(" Gửi MQTT thất bại (publish return false)");
-      }
-    } else {
-      Serial.println(" MQTT chưa kết nối, không gửi được");
-    }
-  }
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("PM2.5:");
+  lcd.print(pm25, 1);
+  lcd.print(" ug");
 
-  delay(5);
+  lcd.setCursor(0, 1);
+  lcd.print("CO2:");
+  lcd.print((int)co2);
+  lcd.print(" ppm");
+
+  delay(3000);
 }

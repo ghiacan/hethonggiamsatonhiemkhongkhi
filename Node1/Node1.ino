@@ -3,7 +3,7 @@
 #include <LiquidCrystal_I2C.h>
 
 // ================= LCD 16x2 =================
-LiquidCrystal_I2C lcd(0x27, 16, 2);   // đổi 0x3F nếu không hiển thị
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // --- LoRa AS32 TTL ---
 #define LORA_TX 17
