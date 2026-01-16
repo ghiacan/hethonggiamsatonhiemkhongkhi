@@ -1,131 +1,152 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-// --- LoRa AS32 TTL ---
+
+/* ================== LoRa AS32 TTL ================== */
 #define LORA_TX 17
 #define LORA_RX 16
-#define M0_PIN 25
-#define M1_PIN 26
+#define M0_PIN  25
+#define M1_PIN  26
 
-// --- GP2Y1010 PM2.5 ---
-#define LED_PWR  4
-#define PM25_PIN 34
+/* ================== GP2Y1010 PM2.5 ================= */
+#define LED_PWR   4
+#define PM25_PIN  34
 
-// --- MQ-135 CO2 ---
+/* ================== MQ-135 CO2 ===================== */
 #define MQ135_PIN 35
+
+/* ================== LCD ============================ */
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
+/* ================== NODE INFO ====================== */
 String nodeID = "Node2";
 
+/* ================== TIMING ========================= */
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL = 12000;   
+
+/* ================== SENSOR ========================= */
+float pm25 = 0, co2 = 0;
+
+/* ================== DATA ĐÃ GỬI ==================== */
+float pm25_sent = 0, co2_sent = 0;
+
+String data = "";
+
+/* ================== PM2.5 ========================== */
 float readPM25_stable() {
   float sum = 0;
   const int n = 10;
-  for(int i=0; i<3; i++){
+
+  for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PWR, HIGH);
     delayMicroseconds(280);
     digitalWrite(LED_PWR, LOW);
     delay(50);
   }
 
-  for(int i=0; i<n; i++){
+  for (int i = 0; i < n; i++) {
     digitalWrite(LED_PWR, HIGH);
     delayMicroseconds(280);
     int val = analogRead(PM25_PIN);
     digitalWrite(LED_PWR, LOW);
 
-    float voltage = val * (3.3 / 4095.0);
+    float voltage = val * (3.3 / 4094.0);
+    float pm = (voltage - 0.9) / 0.5;
+    if (pm < 0) pm = 0;
 
-    float pm25 = 0.172 * voltage - 0.1;
-    if(pm25 < 0) pm25 = 0;
-
-    sum += pm25;
+    sum += pm;
     delay(10);
   }
+
   return sum / n;
 }
 
-
-// --- Hàm đọc CO2 MQ-135 trung bình nhiều lần ---
+/* ================== CO2 ============================ */
 float readCO2() {
   const int n = 30;
   float sum = 0;
 
   for (int i = 0; i < n; i++) {
-    int raw = analogRead(MQ135_PIN);
-    sum += raw;
+    sum += analogRead(MQ135_PIN);
     delay(20);
   }
 
-  float adc = sum / n;               
-  float voltage = adc * (3.3 / 4095.0);  
-  float ppm = (voltage - 0.2) * (5000.0 / (2.8 - 0.2));  
-
-  // ---- GIỚI HẠN ----
-  if (ppm < 400) ppm = 400;
-  if (ppm > 5000) ppm = 5000;
-
+  float adc = sum / n;
+  float voltage = adc * (3.3 / 4095.0);
+  float ppm = (voltage - 0.2) * (5000.0 / (2.8 - 0.2));
   return ppm;
 }
 
+/* ================== LCD UPDATE ===================== */
+void updateLCD() {
+  lcd.setCursor(0, 0);
+  lcd.print("PM2.5:");
+  lcd.print(pm25_sent, 1);
+  lcd.print("   ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("CO2:");
+  lcd.print(co2_sent, 1);
+  lcd.print(" ppm   ");
+}
+
+/* ================== SETUP ========================== */
 void setup() {
   Serial.begin(115200);
 
-  // --- Thiết lập M0/M1 ở Mode Normal ---
   pinMode(M0_PIN, OUTPUT);
   pinMode(M1_PIN, OUTPUT);
   digitalWrite(M0_PIN, LOW);
   digitalWrite(M1_PIN, LOW);
 
+  lastSend = millis() + 2500;  
+
   pinMode(LED_PWR, OUTPUT);
-  Wire.begin(21, 22);   // SDA, SCL
+
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-
-  lcd.setCursor(0, 0);
   lcd.print("Node2 Starting");
-  lcd.setCursor(0, 1);
-  lcd.print("Sensor Init...");
-
-  delay(3000);
 
   Serial2.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
 
+  delay(2000);
   lcd.clear();
-  lcd.setCursor(0, 0);
   lcd.print("Node2 Ready");
-  lcd.setCursor(0, 1);
-  lcd.print("LoRa OK");
 
+  Serial.println("Node2 ready");
 }
 
+/* ================== LOOP =========================== */
 void loop() {
-  // --- Đọc PM2.5 và CO2 ---
-  float pm25 = readPM25_stable();
-  float co2 = readCO2();
 
-  // --- Chuỗi dữ liệu CSV ---
-  String data = nodeID + ",";
-  data += "PM25:" + String(pm25, 1) + ",";
-  data += "CO2:" + String(co2, 0);
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis() ;
 
-  // --- Gửi qua LoRa ---
-  Serial2.println(data);
+    // ĐO
+    pm25 = readPM25_stable();
+    co2  = readCO2();
 
-  // --- In Serial monitor ---
-  Serial.print("Đang gửi: ");
-  Serial.println(data);
+    // BUILD PAYLOAD
+    data = nodeID +
+           ",PM25:" + String(pm25, 1) +
+           ",CO2:"  + String(co2, 1);
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("PM2.5:");
-  lcd.print(pm25, 1);
-  lcd.print(" ug");
+    // SEND LORA
+    for (int i = 0; i < data.length(); i++) {
+      Serial2.write(data[i]);
+      delay(2);
+    }
+    Serial2.write('\n');
 
-  lcd.setCursor(0, 1);
-  lcd.print("CO2:");
-  lcd.print((int)co2);
-  lcd.print(" ppm");
+    Serial.print("[TX] ");
+    Serial.println(data);
 
-  delay(3000);
+    // ===== CHỈ SAU KHI GỬI =====
+    pm25_sent = pm25;
+    co2_sent  = co2;
+
+    updateLCD();
+  }
 }

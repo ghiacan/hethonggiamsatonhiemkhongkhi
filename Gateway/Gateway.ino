@@ -5,79 +5,122 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ================== WiFi ==================
-const char* WIFI_SSID     = "Nghia";
+/* ================== WIFI ================== */
+const char* WIFI_SSID = "Nghia";
 const char* WIFI_PASSWORD = "11223344";
 
-// ================== MQTT Cloud ==================
-const char* MQTT_SERVER   = "140c1fe0108343549da9b96c9afed071.s1.eu.hivemq.cloud";
-const uint16_t MQTT_PORT  = 8883;
-const char* MQTT_USER     = "ducnghia";
-const char* MQTT_PASS     = "Asd3092003";
-const char* MQTT_CLIENT_ID = "Gateway";
-
+/* ================== MQTT ================== */
+const char* MQTT_SERVER = "140c1fe0108343549da9b96c9afed071.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+const char* MQTT_USER = "ducnghia";
+const char* MQTT_PASS = "Asd3092003";
+const char* MQTT_CLIENT_ID = "ESP32_Gateway";
 const char* MQTT_TOPIC = "iot/air/";
 
-// ================== LoRa ==================
+/* ================== LoRa AS32 ================== */
 HardwareSerial LoRaSerial(2);
 #define LORA_RX 16
 #define LORA_TX 17
 #define M0_PIN  25
 #define M1_PIN  26
 
-// ================== LCD + Button ==================
+/* ================== LCD + BUTTON ================== */
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define BTN_PIN 27
-int currentScreen = 0;
-unsigned long lastBtnTime = 0;
 
-// ================== BIẾN ==================
+/* ================== MQTT CLIENT ================== */
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
-// dữ liệu Node
+/* ================== DATA ================== */
 float pm25_1 = 0, co2_1 = 0;
 float pm25_2 = 0, co2_2 = 0;
 
+/* ================== STATE ================== */
+int currentScreen = 0;               // 0 = Node1 | 1 = Node2
+unsigned long lastBtnTime = 0;
+unsigned long lastLCDUpdate = 0;
+const unsigned long LCD_INTERVAL = 1000;
 
-// ================== WIFI ==================
+/* ================== WIFI ================== */
 void setupWiFi() {
+  Serial.print("[WiFi] Connecting");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting WiFi");
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
+  Serial.println("\n[WiFi] Connected");
 }
 
-// ================== MQTT ==================
+/* ================== MQTT ================== */
 void connectMQTT() {
   while (!mqttClient.connected()) {
-    Serial.print("Connecting MQTT...");
+    Serial.print("[MQTT] Connecting...");
     if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
       Serial.println("OK");
     } else {
+      Serial.print(" FAIL rc=");
+      Serial.println(mqttClient.state());
       delay(3000);
     }
   }
 }
+/* ================== PARSE DATA ================== */
+void parseData(const String& payload) {
+  int p1 = payload.indexOf("PM25:");
+  int p2 = payload.indexOf(",CO2:");
+  if (p1 < 0 || p2 < 0) return;
 
-// ================== PARSE DATA ==================
-void parseData(String payload) {
-  // VD: Node1,PM25:35.2,CO2:820
-  if (payload.indexOf("Node1") >= 0) {
-    pm25_1 = payload.substring(payload.indexOf("PM25:") + 5, payload.indexOf(",CO2")).toFloat();
-    co2_1  = payload.substring(payload.indexOf("CO2:") + 4).toFloat();
+  float pm  = payload.substring(p1 + 5, p2).toFloat();
+  float co2 = payload.substring(p2 + 5).toFloat();
+
+  if (payload.startsWith("Node1")) {
+    pm25_1 = pm;
+    co2_1  = co2;
+  } 
+  else if (payload.startsWith("Node2")) {
+    pm25_2 = pm;
+    co2_2  = co2;
   }
-  else if (payload.indexOf("Node2") >= 0) {
-    pm25_2 = payload.substring(payload.indexOf("PM25:") + 5, payload.indexOf(",CO2")).toFloat();
-    co2_2  = payload.substring(payload.indexOf("CO2:") + 4).toFloat();
+  updateLCD();
+}
+
+/* ================== FAST LORA RX (CÁCH 2) ================== */
+void readLoRaFast() {
+  static String rx = "";
+  static unsigned long lastByteTime = 0;
+
+  while (LoRaSerial.available()) {
+    char c = LoRaSerial.read();
+    lastByteTime = millis();
+
+    if (c == '\n') {
+      rx.trim();
+      Serial.print("[LoRa RX] ");
+      Serial.println(rx);
+
+      if (rx.startsWith("Node")) {
+        parseData(rx);
+
+        String topic = String(MQTT_TOPIC) +
+                       (rx.startsWith("Node1") ? "node1" : "node2");
+        mqttClient.publish(topic.c_str(), rx.c_str());
+      }
+
+      rx = "";
+    } else {
+      rx += c;
+    }
+  }
+
+  // reset nếu frame lỗi
+  if (rx.length() > 0 && millis() - lastByteTime > 50) {
+    rx = "";
   }
 }
 
-// ================== LCD ==================
+/* ================== LCD ================== */
 void updateLCD() {
   lcd.clear();
   if (currentScreen == 0) {
@@ -87,7 +130,7 @@ void updateLCD() {
     lcd.print("PM:");
     lcd.print(pm25_1, 1);
     lcd.print(" CO2:");
-    lcd.print((int)co2_1);
+    lcd.print(co2_1, 1);
   } else {
     lcd.setCursor(0, 0);
     lcd.print("Node 2");
@@ -95,11 +138,11 @@ void updateLCD() {
     lcd.print("PM:");
     lcd.print(pm25_2, 1);
     lcd.print(" CO2:");
-    lcd.print((int)co2_2);
+    lcd.print(co2_2, 1);
   }
 }
 
-// ================== SETUP ==================
+/* ================== SETUP ================== */
 void setup() {
   Serial.begin(115200);
 
@@ -116,9 +159,10 @@ void setup() {
   // LCD
   lcd.init();
   lcd.backlight();
-  lcd.print("Gateway Starting");
+  lcd.print("Gateway Start");
 
   setupWiFi();
+
   espClient.setInsecure();
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
 
@@ -126,31 +170,27 @@ void setup() {
   lcd.clear();
 }
 
-// ================== LOOP ==================
+/* ================== LOOP ================== */
 void loop() {
+  readLoRaFast();        
+
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
 
-  // Đọc LoRa
-  if (LoRaSerial.available()) {
-    String data = LoRaSerial.readStringUntil('\n');
-    data.trim();
-    Serial.println(data);
+  // ---- Button toggle Node1 <-> Node2 ----
+  if (digitalRead(BTN_PIN) == LOW) {
+    if (millis() - lastBtnTime > 300) {
+      currentScreen = !currentScreen;
+      lastBtnTime = millis();
+      updateLCD();              // đổi màn hình NGAY
+      Serial.print("[BTN] Screen = ");
+      Serial.println(currentScreen);
+    }
+  }
 
-    parseData(data);
-
-    String topic = String(MQTT_TOPIC) + (data.startsWith("Node1") ? "node1" : "node2");
-    mqttClient.publish(topic.c_str(), data.c_str());
-
+  // ---- periodic LCD refresh ----
+  if (millis() - lastLCDUpdate > LCD_INTERVAL) {
     updateLCD();
+    lastLCDUpdate = millis();
   }
-
-  // Đọc nút nhấn (debounce)
-  if (digitalRead(BTN_PIN) == LOW) {      
-  if (millis() - lastBtnTime > 300) {     
-    currentScreen = !currentScreen;    
-    updateLCD();                          
-    lastBtnTime = millis();
-  }
-}
 }
